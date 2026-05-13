@@ -15,17 +15,24 @@ The model directory is local-only (gitignored).
 
 import json
 import os
-
+import torch
 import numpy as np
 import pandas as pd
 from datasets import Dataset, DatasetDict
-from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from transformers import (
     AutoModelForSequenceClassification,
     AutoTokenizer,
     DataCollatorWithPadding,
     Trainer,
     TrainingArguments,
+    set_seed,
 )
 
 
@@ -48,35 +55,27 @@ def prepare_dataset(data_path: str, test_size: float = 0.2, seed: int = 42) -> D
     """
     Load the CSV at `data_path` and produce a train/test split.
 
-    The CSV must have at least `text` and `label` columns. (The curated
-    `data/app_reviews_train.csv` also includes `app`, `app_name`, and `rating`
-    columns — these are useful for inspection but not required by the model.)
+    The CSV must have at least `text` and `label` columns.
 
     Returns a `DatasetDict` with "train" and "test" keys.
     """
-    # TODO: read the CSV with pandas
-    # TODO: convert with Dataset.from_pandas(df, preserve_index=False)
-    # TODO: split with .train_test_split(test_size=test_size, seed=seed)
-    # TODO: return the resulting DatasetDict
-    raise NotImplementedError
+    df = pd.read_csv(data_path)
+    ds = Dataset.from_pandas(df, preserve_index=False)
+    split = ds.train_test_split(test_size=test_size, seed=seed)
+    return split
 
 
 def tokenize_dataset(ds_dict: DatasetDict, tokenizer, max_length: int = 128) -> DatasetDict:
     """
     Tokenize all splits in a DatasetDict.
 
-    `tokenizer` is a loaded HuggingFace tokenizer (callable) — load it once
-    in `main()` via `AutoTokenizer.from_pretrained(...)` and pass it in.
-    Use truncation=True and max_length=max_length. Do not pad here — padding is
-    applied dynamically by DataCollatorWithPadding at training time.
-
-    Note: this signature differs from the drill (`tokenize_dataset(ds, name)`)
-    by accepting the loaded tokenizer object so `main()` doesn't re-load it.
+    `tokenizer` is a loaded HuggingFace tokenizer (callable).
+    Use truncation=True and max_length=max_length. Do not pad here.
     """
-    # TODO: define tokenize_fn(batch) calling the passed-in tokenizer with truncation + max_length
-    # TODO: apply ds_dict.map(tokenize_fn, batched=True)
-    # TODO: return the tokenized DatasetDict
-    raise NotImplementedError
+    def tokenize_fn(batch):
+        return tokenizer(batch["text"], truncation=True, max_length=max_length)
+
+    return ds_dict.map(tokenize_fn, batched=True)
 
 
 def make_training_args(
@@ -87,13 +86,17 @@ def make_training_args(
     seed: int = 42,
 ) -> TrainingArguments:
     """Return a TrainingArguments configured for fine-tuning."""
-    # TODO: return a TrainingArguments configured with the passed arguments.
-    # In addition to wiring the kwargs through, set:
-    #   - eval_strategy="epoch"           (renamed from evaluation_strategy in transformers 4.41+)
-    #   - save_strategy="epoch"
-    #   - logging_steps=50
-    # The course pins transformers>=4.41,<5.0 — use the new argument names.
-    raise NotImplementedError
+    return TrainingArguments(
+        output_dir=output_dir,
+        learning_rate=lr,
+        num_train_epochs=epochs,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        seed=seed,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        logging_steps=50,
+    )
 
 
 def compute_metrics(eval_pred):
@@ -102,11 +105,11 @@ def compute_metrics(eval_pred):
 
     Use sklearn's accuracy_score and f1_score with average="macro".
     """
-    # TODO: unpack eval_pred to logits, labels
-    # TODO: argmax logits over axis 1
-    # TODO: compute accuracy and macro-F1
-    # TODO: return as a dict
-    raise NotImplementedError
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=1)
+    accuracy = accuracy_score(labels, preds)
+    macro_f1 = f1_score(labels, preds, average="macro")
+    return {"accuracy": accuracy, "macro_f1": macro_f1}
 
 
 def train_classifier(
@@ -119,18 +122,29 @@ def train_classifier(
     """
     Construct and train a Trainer.
 
-    Returns the trained Trainer (trainer.model is the fine-tuned model). Pass
-    id2label=ID2LABEL and label2id=LABEL2ID to the model so its config records
-    the human-readable label names — Integration 7A reads them from
-    `model.config.id2label` rather than hard-coding.
+    Returns the trained Trainer (trainer.model is the fine-tuned model).
     """
-    # TODO: load model with AutoModelForSequenceClassification.from_pretrained(
-    #         model_name, num_labels=num_labels, id2label=ID2LABEL, label2id=LABEL2ID)
-    # TODO: build data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
-    # TODO: build Trainer with model, args, train/eval datasets, tokenizer, data_collator, compute_metrics
-    # TODO: call trainer.train()
-    # TODO: return trainer
-    raise NotImplementedError
+    model = AutoModelForSequenceClassification.from_pretrained(
+        model_name,
+        num_labels=num_labels,
+        id2label=ID2LABEL,
+        label2id=LABEL2ID,
+    )
+    data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_ds["train"],
+        eval_dataset=tokenized_ds["test"],
+        processing_class=tokenizer,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+    )
+    print("CUDA Available:", torch.cuda.is_available())
+    print("Device:", torch.cuda.get_device_name(0))
+    print("Trainer device:", trainer.args.device)
+    trainer.train()
+    return trainer
 
 
 def evaluate_classifier(trainer: Trainer, tokenized_test) -> dict:
@@ -139,19 +153,46 @@ def evaluate_classifier(trainer: Trainer, tokenized_test) -> dict:
 
     Read label names from trainer.model.config.id2label (do not hard-code).
 
-    Returns: {"accuracy": float, "macro_f1": float, "per_class_f1": {label_name: f1, ...}}
+    Returns: {
+        "accuracy": float,
+        "macro_f1": float,
+        "per_class_f1": {label_name: f1, ...},
+        "per_class_precision": {label_name: precision, ...},
+        "per_class_recall": {label_name: recall, ...},
+    }
     """
-    # TODO: predict on tokenized_test using trainer.predict
-    # TODO: argmax predictions to class indices
-    # TODO: compute accuracy and macro-F1
-    # TODO: compute per-class F1 with f1_score(..., average=None)
-    # TODO: build per_class_f1 dict using trainer.model.config.id2label for label names
-    # TODO: return all three
-    raise NotImplementedError
+    id2label = trainer.model.config.id2label
+    preds_output = trainer.predict(tokenized_test)
+    logits = preds_output.predictions
+    labels = preds_output.label_ids
+
+    pred_ids = np.argmax(logits, axis=1)
+
+    accuracy = accuracy_score(labels, pred_ids)
+    macro_f1 = f1_score(labels, pred_ids, average="macro")
+
+    class_f1 = f1_score(labels, pred_ids, average=None)
+    class_precision = precision_score(labels, pred_ids, average=None, zero_division=0)
+    class_recall = recall_score(labels, pred_ids, average=None, zero_division=0)
+
+    num_classes = len(id2label)
+    per_class_f1 = {id2label[i]: float(class_f1[i]) for i in range(num_classes)}
+    per_class_precision = {id2label[i]: float(class_precision[i]) for i in range(num_classes)}
+    per_class_recall = {id2label[i]: float(class_recall[i]) for i in range(num_classes)}
+
+    return {
+        "accuracy": float(accuracy),
+        "macro_f1": float(macro_f1),
+        "per_class_f1": per_class_f1,
+        "per_class_precision": per_class_precision,
+        "per_class_recall": per_class_recall,
+    }
 
 
 def main() -> None:
     """Orchestrate the full pipeline."""
+    set_seed(42)
+
     data_path = get_data_path()
     output_dir = "model"
     model_name = "distilbert-base-uncased"
@@ -168,35 +209,49 @@ def main() -> None:
     trainer.save_model(output_dir)
     tokenizer.save_pretrained(output_dir)
 
+    # Save training log (required by autograder test)
+    with open("training_log.json", "w") as f:
+        json.dump(trainer.state.log_history, f, indent=2)
+
     # Evaluate
     metrics = evaluate_classifier(trainer, tokenized["test"])
     with open("metrics.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # Predictions CSV
+    # Predictions CSV — including per-class probability columns
     pred_logits = trainer.predict(tokenized["test"]).predictions
     pred_idx = np.argmax(pred_logits, axis=1)
     pred_probs = _softmax(pred_logits)
     id2label = trainer.model.config.id2label
+
     df_out = pd.DataFrame({
         "text": ds["test"]["text"],
         "label": [id2label[i] for i in ds["test"]["label"]],
         "predicted_label": [id2label[i] for i in pred_idx],
         "predicted_probability": [float(pred_probs[i, pred_idx[i]]) for i in range(len(pred_idx))],
     })
+
+    # Add per-class probability columns: prob_negative, prob_neutral, prob_positive
+    for class_idx, class_name in id2label.items():
+        df_out[f"prob_{class_name}"] = [float(pred_probs[i, class_idx]) for i in range(len(pred_idx))]
+
     df_out.to_csv("predictions.csv", index=False)
 
     print(f"Accuracy: {metrics['accuracy']:.4f}")
     print(f"Macro-F1: {metrics['macro_f1']:.4f}")
 
-    # Confusion matrix (for the evaluation report)
+    # Confusion matrix — print to stdout and save to CSV
     print("\nConfusion matrix (rows=true, cols=pred):")
-    cm = confusion_matrix(
-        [id2label[i] for i in ds["test"]["label"]],
-        [id2label[i] for i in pred_idx],
-        labels=list(id2label.values()),
-    )
-    print(pd.DataFrame(cm, index=list(id2label.values()), columns=list(id2label.values())).to_string())
+    true_labels = [id2label[i] for i in ds["test"]["label"]]
+    pred_labels = [id2label[i] for i in pred_idx]
+    label_names = list(id2label.values())
+
+    cm = confusion_matrix(true_labels, pred_labels, labels=label_names)
+    cm_df = pd.DataFrame(cm, index=label_names, columns=label_names)
+    print(cm_df.to_string())
+
+    # Save confusion_matrix.csv (required by autograder)
+    cm_df.to_csv("confusion_matrix.csv")
 
     # Push to Hugging Face Hub.
     # Skipped in CI (DATA_PATH set); requires `huggingface-cli login` locally.
