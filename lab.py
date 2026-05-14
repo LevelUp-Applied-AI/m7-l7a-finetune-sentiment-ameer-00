@@ -80,8 +80,8 @@ def tokenize_dataset(ds_dict: DatasetDict, tokenizer, max_length: int = 128) -> 
 
 def make_training_args(
     output_dir: str,
-    lr: float = 5e-5,
-    epochs: int = 2,
+    lr: float = 1e-4,
+    epochs: int = 4,
     batch_size: int = 8,
     seed: int = 42,
 ) -> TrainingArguments:
@@ -140,7 +140,7 @@ def train_classifier(
         data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
-    
+
     if torch.cuda.is_available():
         print("Device:", torch.cuda.get_device_name(0))
     else:
