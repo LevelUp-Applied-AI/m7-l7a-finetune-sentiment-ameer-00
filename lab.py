@@ -140,8 +140,12 @@ def train_classifier(
         data_collator=data_collator,
         compute_metrics=compute_metrics,
     )
-    print("CUDA Available:", torch.cuda.is_available())
-    print("Device:", torch.cuda.get_device_name(0))
+    
+    if torch.cuda.is_available():
+        print("Device:", torch.cuda.get_device_name(0))
+    else:
+        print("Device: CPU")
+
     print("Trainer device:", trainer.args.device)
     trainer.train()
     return trainer
